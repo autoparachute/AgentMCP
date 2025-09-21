@@ -1,0 +1,24 @@
+{
+    "mcpServers": {
+      "operation": {
+        "command": "python",
+        "args": ["E:\\PythonCode\\prompt agent\\src\\mcp server\\operation_server.py"],
+        "transport": "stdio"
+      },
+      "hello": {
+        "command": "python",
+        "args": ["E:\\PythonCode\\prompt agent\\src\\mcp server\\hello_server.py"],
+        "transport": "stdio"
+      },
+      "database": {
+        "command": "python",
+        "args": ["E:\\PythonCode\\prompt agent\\src\\mcp server\\database_server.py"],
+        "transport": "stdio"
+      },
+      "rag": {
+        "command": "python",
+        "args": ["E:\\PythonCode\\prompt agent\\src\\mcp server\\rag_server.py"],
+        "transport": "stdio"
+      }
+    }
+  }

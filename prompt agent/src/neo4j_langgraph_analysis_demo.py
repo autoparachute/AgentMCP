@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-LangGraph-based Neo4j text-to-Cypher demo.
+LangGraph-based Neo4j text-to-Cypher demo with Graph Analysis Layer.
 
-This example migrates from GraphCypherQAChain to a more production-oriented
-LangGraph workflow with explicit guardrails, few-shot guided Cypher generation,
-Cypher validation/correction, execution, and final answer generation.
+This variant inserts an "analyze_graph_results" node between Cypher execution
+and final answer generation to perform L1-L4 analysis (structure, statistics,
+graph algorithms, and insight generation).
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain.output_parsers import PydanticOutputParser
+from langchain_core.tools import Tool
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.embeddings import DashScopeEmbeddings
@@ -32,7 +33,8 @@ from langchain_neo4j.chains.graph_qa.cypher_utils import (
 from langchain_core.example_selectors import SemanticSimilarityExampleSelector
 
 from langgraph.graph import END, START, StateGraph
-from langchain_community.vectorstores import FAISS
+
+import networkx as nx
 
 
 # -----------------------------
@@ -95,6 +97,7 @@ class OverallState(TypedDict):
     cypher_statement: str
     cypher_errors: List[str]
     database_records: List[dict] | str | None
+    graph_analysis: Dict[str, Any]
     steps: Annotated[List[str], add]
 
 
@@ -161,6 +164,7 @@ def guardrails(state: InputState) -> OverallState:
     return {
         "next_action": guardrails_output.decision,
         "database_records": database_records,
+        "graph_analysis": {},
         "steps": ["guardrail"],
     }
 
@@ -204,21 +208,28 @@ examples = [
     },
 ]
 
-# 创建内存向量存储
-vector_store = FAISS.from_texts(
-    [f"Question: {ex['question']}\nCypher: {ex['query']}" for ex in examples],
-    embeddings
-)
-
 example_selector = SemanticSimilarityExampleSelector.from_examples(
     examples,
     embeddings,
-    # 使用FAISS作为向量存储，避免Neo4j事务问题
-    vectorstore_cls=FAISS,
+    # Use Neo4jVector as the vector store class; it will write vectors into Neo4j
+    # under the hood using the env-provided credentials.
+    # We pass extra kwargs commonly supported by Neo4jVector.from_texts
+    # so the selector can construct the vector index.
+    # Note: this assumes Neo4j supports vector indexes in your environment.
+    vectorstore_cls=Neo4jVector,
     k=5,
     input_keys=["question"],
-    vectorstore_kwargs={},
+    vectorstore_kwargs={
+        "url": NEO4J_URI,
+        "username": NEO4J_USERNAME,
+        "password": NEO4J_PASSWORD,
+        "index_name": "example_selector_index",
+        "node_label": "Example",
+        "text_node_property": "text",
+        "embedding_node_property": "embedding",
+    },
 )
+
 
 # -----------------------------
 # Text-to-Cypher generation
@@ -519,41 +530,140 @@ def execute_cypher(state: OverallState) -> OverallState:
 
 
 # -----------------------------
-# Final answer generation
+# Graph Analysis Layer (L1-L4)
 # -----------------------------
 
-generate_final_prompt = ChatPromptTemplate.from_messages(
-    [
-        (
-            "system",
-            "You are a helpful assistant",
-        ),
-        (
-            "human",
-            (
-                """Use the following results retrieved from a database to provide
-a succinct, definitive answer to the user's question.
+def build_subgraph_from_records(records: List[Dict[str, Any]]) -> nx.Graph:
+    """
+    L1: Build a NetworkX graph from Cypher query records.
+    This is a generic example that tries to connect two actors if present.
+    Adapt this mapping as needed for your schema/record shapes.
+    """
+    G = nx.Graph()
+    for record in records:
+        # Heuristic extraction: try common keys
+        node_a = record.get("actor1") or record.get("a") or record.get("person1") or record.get("source")
+        node_b = record.get("actor2") or record.get("b") or record.get("person2") or record.get("target")
+        movie = record.get("movie") or record.get("m") or record.get("title")
 
-Respond as if you are answering the question directly.
+        # If Neo4j returns nodes/relationships objects, attempt to stringify
+        if hasattr(node_a, "get") and callable(getattr(node_a, "get")):
+            node_a = node_a.get("name") or node_a.get("title") or str(node_a)
+        if hasattr(node_b, "get") and callable(getattr(node_b, "get")):
+            node_b = node_b.get("name") or node_b.get("title") or str(node_b)
 
-Results: {results}
-Question: {question}"""
-            ),
-        ),
-    ]
-)
+        if node_a and node_b:
+            G.add_node(node_a, type="Actor")
+            G.add_node(node_b, type="Actor")
+            G.add_edge(node_a, node_b, movie=str(movie) if movie is not None else None, relationship="CO_STARRED")
+        else:
+            # Fallback: add any scalar fields as isolated nodes
+            for key, val in record.items():
+                if isinstance(val, (str, int, float)):
+                    G.add_node(f"{key}:{val}")
+    return G
 
-generate_final_chain = generate_final_prompt | llm | StrOutputParser()
 
+def analyze_statistics(G: nx.Graph) -> Dict[str, Any]:
+    """L2: Basic statistics over the subgraph."""
+    degrees = dict(G.degree())
+    most_connected = max(degrees.items(), key=lambda x: x[1]) if degrees else (None, 0)
+    stats: Dict[str, Any] = {
+        "total_nodes": G.number_of_nodes(),
+        "total_edges": G.number_of_edges(),
+        "most_connected": {"node": most_connected[0], "degree": most_connected[1]},
+    }
+    return stats
+
+
+def analyze_network(G: nx.Graph) -> Dict[str, Any]:
+    """L3: Graph algorithms using NetworkX (betweenness centrality, communities)."""
+    try:
+        if G.number_of_nodes() == 0:
+            return {"hub_actor": None, "centrality_score": 0.0, "num_communities": 0, "communities": []}
+
+        centrality = nx.betweenness_centrality(G)
+        top_hub = max(centrality, key=centrality.get) if centrality else None
+
+        # community detection (greedy modularity)
+        try:
+            communities = list(nx.community.greedy_modularity_communities(G))
+        except Exception:
+            communities = []
+        num_communities = len(communities)
+
+        return {
+            "hub_actor": top_hub,
+            "centrality_score": centrality.get(top_hub, 0.0) if top_hub is not None else 0.0,
+            "num_communities": num_communities,
+            "communities": [list(c) for c in communities[:3]],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# L4: Insight generation prompt and chain
+insight_prompt = ChatPromptTemplate.from_messages([
+    ("system", "你是一个图数据分析专家。请根据以下统计和图算法结果，生成一段简洁、有洞察力的自然语言总结。避免技术术语，突出关键发现。"),
+    ("human", """
+【原始问题】{question}
+【查询结果】{results}
+【统计信息】{stats}
+【图分析结果】{graph_analysis}
+
+请生成一条洞察式回答：
+"""),
+])
+
+insight_chain = insight_prompt | llm | StrOutputParser()
+
+
+def analyze_graph_results(state: OverallState) -> OverallState:
+    records = state.get("database_records")
+    if not records or isinstance(records, str):
+        return {"graph_analysis": {}, "steps": ["analyze_graph_results"]}
+
+    # L1: 构建子图
+    G = build_subgraph_from_records(records)
+
+    # L2: 统计分析
+    stats = analyze_statistics(G)
+
+    # L3: 图算法分析
+    graph_alg = analyze_network(G)
+
+    analysis = {
+        "statistics": stats,
+        "graph_insights": graph_alg,
+        "has_analysis": True,
+    }
+
+    return {
+        "graph_analysis": analysis,
+        "steps": ["analyze_graph_results"],
+    }
+
+
+# -----------------------------
+# Final answer generation (uses insights)
+# -----------------------------
 
 def generate_final_answer(state: OverallState) -> OutputState:
-    """
-    Decides if the question is related to movies.
-    """
-    final_answer = generate_final_chain.invoke(
-        {"question": state.get("question"), "results": state.get("database_records")}
-    )
-    return {"answer": final_answer, "steps": ["generate_final_answer"]}
+    results = state.get("database_records")
+    analysis = state.get("graph_analysis", {})
+
+    final_answer = insight_chain.invoke({
+        "question": state.get("question"),
+        "results": results,
+        "stats": analysis.get("statistics", {}),
+        "graph_analysis": analysis.get("graph_insights", {}),
+    })
+
+    return {
+        "answer": final_answer,
+        "steps": ["generate_final_answer"],
+        "cypher_statement": state.get("cypher_statement"),
+    }
 
 
 # -----------------------------
@@ -597,6 +707,7 @@ def build_langgraph():
     graph.add_node(validate_cypher)
     graph.add_node(correct_cypher)
     graph.add_node(execute_cypher)
+    graph.add_node(analyze_graph_results)
     graph.add_node(generate_final_answer)
 
     graph.add_edge(START, "guardrails")
@@ -609,7 +720,8 @@ def build_langgraph():
         "validate_cypher",
         validate_cypher_condition,
     )
-    graph.add_edge("execute_cypher", "generate_final_answer")
+    graph.add_edge("execute_cypher", "analyze_graph_results")
+    graph.add_edge("analyze_graph_results", "generate_final_answer")
     graph.add_edge("correct_cypher", "validate_cypher")
     graph.add_edge("generate_final_answer", END)
 
@@ -626,19 +738,120 @@ def _try_display_graph(compiled_graph) -> None:
         pass
 
 
-def demo() -> None:
+def create_neo4j_langgraph_tool() -> Tool:
+    """创建一个 LangChain Tool，使 Agent 能够调用 Neo4j LangGraph 工作流。"""
     lg = build_langgraph()
-    _try_display_graph(lg)
+    
+    def _run(question: str) -> str:
+        try:
+            result = lg.invoke({"question": question})
+            # 格式化输出结果
+            if isinstance(result, dict):
+                answer = result.get("answer", "No answer generated")
+                steps = result.get("steps", [])
+                cypher = result.get("cypher_statement", "No Cypher generated")
+                
+                response = f"Answer: {answer}\n"
+                if cypher and cypher != "No Cypher generated":
+                    response += f"Cypher Query: {cypher}\n"
+                if steps:
+                    response += f"Processing Steps: {', '.join(steps)}"
+                return response
+            return str(result)
+        except Exception as exc:
+            return f"Neo4j LangGraph 查询失败: {exc}"
 
-    # Irrelevant question
-    res1 = lg.invoke({"question": "What's the weather in Spain?"})
-    print("Irrelevant question result:\n", res1)
+    async def _arun(question: str) -> str:
+        try:
+            result = await lg.ainvoke({"question": question})
+            if isinstance(result, dict):
+                answer = result.get("answer", "No answer generated")
+                steps = result.get("steps", [])
+                cypher = result.get("cypher_statement", "No Cypher generated")
+                
+                response = f"Answer: {answer}\n"
+                if cypher and cypher != "No Cypher generated":
+                    response += f"Cypher Query: {cypher}\n"
+                if steps:
+                    response += f"Processing Steps: {', '.join(steps)}"
+                return response
+            return str(result)
+        except Exception as exc:
+            return f"Neo4j LangGraph 查询失败: {exc}"
 
-    # Relevant question
-    res2 = lg.invoke({"question": "What was the cast of the Casino?"})
-    print("\nMovie question result:\n", res2)
+    return Tool(
+        name="neo4j_langgraph_query",
+        description=(
+            "使用高级 LangGraph 工作流查询 Neo4j 图数据库的工具。"
+            "该工具包含完整的 Cypher 生成、验证、修正和执行流程，并带有图分析层，"
+            "能够处理复杂的电影相关问题并输出洞察性的总结。"
+        ),
+        func=_run,
+        coroutine=_arun,
+    )
 
+
+async def run_neo4j_langgraph_agent_chat() -> None:
+    """启动基于 LangGraph 的 Neo4j Agent 聊天循环。"""
+    from langchain.agents import AgentExecutor, create_openai_tools_agent
+    from langchain.chat_models import init_chat_model
+    from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+    import logging
+
+    # 设置日志
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+    # 构建 Neo4j LangGraph 工具
+    neo4j_tool = create_neo4j_langgraph_tool()
+
+    # 构造 Agent
+    system_prompt = (
+        "你是一个基于高级 LangGraph 工作流的电影图数据库智能助理。\n"
+        "图结构说明：\n"
+        "- 节点标签：Movie、Person、Genre。\n"
+        "- 关系类型：(:Person)-[:DIRECTED]->(:Movie)，(:Person)-[:ACTED_IN]->(:Movie)，(:Movie)-[:IN_GENRE]->(:Genre)。\n"
+        "- 关键属性：Movie(title, released, imdbRating, id)，Person(name)，Genre(name)。\n"
+        "使用指南：\n"
+        "- 当用户提出与电影、演员、导演、类型、评分、年份、路径/关联统计相关的问题时，优先调用工具 neo4j_langgraph_query。\n"
+        "- 该工具使用高级 LangGraph 工作流，包含完整的 Cypher 生成、验证、修正和执行流程，并在执行后加入图分析层生成洞察。\n"
+        "- 在仅需通识解释或闲聊时再直接回答。\n"
+        "- 回答使用简体中文，给出关键实体名与数字；必要时列出前若干条并保持简洁。\n"
+        "- 如果问题与电影无关，工具会自动识别并给出相应提示。\n"
+    )
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("user", "{input}"),
+        MessagesPlaceholder("agent_scratchpad"),
+    ])
+
+    # 使用与 LangGraph 相同的 LLM 配置
+    agent_llm = ChatOpenAI(
+        model=MODEL,
+        temperature=0,
+        api_key=os.getenv("OPENAI_API_KEY"),
+        base_url=os.getenv("OPENAI_BASE_URL"),
+    )
+
+    agent = create_openai_tools_agent(agent_llm, [neo4j_tool], prompt)
+    agent_executor = AgentExecutor(agent=agent, tools=[neo4j_tool], verbose=True)
+
+    print("\n基于 LangGraph 的 Neo4j Agent 已启动，输入 'quit' 退出")
+    
+    while True:
+        user_input = input("\n你: ").strip()
+        if user_input.lower() == "quit":
+            break
+        try:
+            result = await agent_executor.ainvoke({"input": user_input})
+            print(f"\nAI: {result['output']}")
+        except Exception as exc:
+            print(f"\n 出错: {exc}")
+
+    print(" 资源已清理，Bye!")
 
 if __name__ == "__main__":
-    demo()
+    import asyncio
+    asyncio.run(run_neo4j_langgraph_agent_chat())
+
 

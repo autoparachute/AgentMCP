@@ -19,6 +19,11 @@
         "command": "python",
         "args": ["E:\\PythonCode\\prompt agent\\src\\mcp server\\rag_server.py"],
         "transport": "stdio"
+      },
+      "neo4j": {
+        "command": "python",
+        "args": ["E:\\PythonCode\\prompt agent\\src\\mcp server\\neo4j_server.py"],
+        "transport": "stdio"
       }
     }
   }

@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain.output_parsers import PydanticOutputParser
+from langchain_core.tools import Tool
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.embeddings import DashScopeEmbeddings
@@ -32,7 +33,6 @@ from langchain_neo4j.chains.graph_qa.cypher_utils import (
 from langchain_core.example_selectors import SemanticSimilarityExampleSelector
 
 from langgraph.graph import END, START, StateGraph
-from langchain_community.vectorstores import FAISS
 
 
 # -----------------------------
@@ -204,21 +204,28 @@ examples = [
     },
 ]
 
-# 创建内存向量存储
-vector_store = FAISS.from_texts(
-    [f"Question: {ex['question']}\nCypher: {ex['query']}" for ex in examples],
-    embeddings
-)
-
 example_selector = SemanticSimilarityExampleSelector.from_examples(
     examples,
     embeddings,
-    # 使用FAISS作为向量存储，避免Neo4j事务问题
-    vectorstore_cls=FAISS,
+    # Use Neo4jVector as the vector store class; it will write vectors into Neo4j
+    # under the hood using the env-provided credentials.
+    # We pass extra kwargs commonly supported by Neo4jVector.from_texts
+    # so the selector can construct the vector index.
+    # Note: this assumes Neo4j supports vector indexes in your environment.
+    vectorstore_cls=Neo4jVector,
     k=5,
     input_keys=["question"],
-    vectorstore_kwargs={},
+    vectorstore_kwargs={
+        "url": NEO4J_URI,
+        "username": NEO4J_USERNAME,
+        "password": NEO4J_PASSWORD,
+        "index_name": "example_selector_index",
+        "node_label": "Example",
+        "text_node_property": "text",
+        "embedding_node_property": "embedding",
+    },
 )
+
 
 # -----------------------------
 # Text-to-Cypher generation
@@ -626,19 +633,119 @@ def _try_display_graph(compiled_graph) -> None:
         pass
 
 
-def demo() -> None:
+def create_neo4j_langgraph_tool() -> Tool:
+    """创建一个 LangChain Tool，使 Agent 能够调用 Neo4j LangGraph 工作流。"""
     lg = build_langgraph()
-    _try_display_graph(lg)
+    
+    def _run(question: str) -> str:
+        try:
+            result = lg.invoke({"question": question})
+            # 格式化输出结果
+            if isinstance(result, dict):
+                answer = result.get("answer", "No answer generated")
+                steps = result.get("steps", [])
+                cypher = result.get("cypher_statement", "No Cypher generated")
+                
+                response = f"Answer: {answer}\n"
+                if cypher and cypher != "No Cypher generated":
+                    response += f"Cypher Query: {cypher}\n"
+                if steps:
+                    response += f"Processing Steps: {', '.join(steps)}"
+                return response
+            return str(result)
+        except Exception as exc:
+            return f"Neo4j LangGraph 查询失败: {exc}"
 
-    # Irrelevant question
-    res1 = lg.invoke({"question": "What's the weather in Spain?"})
-    print("Irrelevant question result:\n", res1)
+    async def _arun(question: str) -> str:
+        try:
+            result = await lg.ainvoke({"question": question})
+            if isinstance(result, dict):
+                answer = result.get("answer", "No answer generated")
+                steps = result.get("steps", [])
+                cypher = result.get("cypher_statement", "No Cypher generated")
+                
+                response = f"Answer: {answer}\n"
+                if cypher and cypher != "No Cypher generated":
+                    response += f"Cypher Query: {cypher}\n"
+                if steps:
+                    response += f"Processing Steps: {', '.join(steps)}"
+                return response
+            return str(result)
+        except Exception as exc:
+            return f"Neo4j LangGraph 查询失败: {exc}"
 
-    # Relevant question
-    res2 = lg.invoke({"question": "What was the cast of the Casino?"})
-    print("\nMovie question result:\n", res2)
+    return Tool(
+        name="neo4j_langgraph_query",
+        description=(
+            "使用高级 LangGraph 工作流查询 Neo4j 图数据库的工具。"
+            "该工具包含完整的 Cypher 生成、验证、修正和执行流程，"
+            "能够处理复杂的电影相关问题。输入自然语言问题，工具会"
+            "自动生成、验证并执行 Cypher 查询。"
+        ),
+        func=_run,
+        coroutine=_arun,
+    )
 
+
+async def run_neo4j_langgraph_agent_chat() -> None:
+    """启动基于 LangGraph 的 Neo4j Agent 聊天循环。"""
+    from langchain.agents import AgentExecutor, create_openai_tools_agent
+    from langchain.chat_models import init_chat_model
+    from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+    import logging
+
+    # 设置日志
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+    # 构建 Neo4j LangGraph 工具
+    neo4j_tool = create_neo4j_langgraph_tool()
+
+    # 构造 Agent
+    system_prompt = (
+        "你是一个基于高级 LangGraph 工作流的电影图数据库智能助理。\n"
+        "图结构说明：\n"
+        "- 节点标签：Movie、Person、Genre。\n"
+        "- 关系类型：(:Person)-[:DIRECTED]->(:Movie)，(:Person)-[:ACTED_IN]->(:Movie)，(:Movie)-[:IN_GENRE]->(:Genre)。\n"
+        "- 关键属性：Movie(title, released, imdbRating, id)，Person(name)，Genre(name)。\n"
+        "使用指南：\n"
+        "- 当用户提出与电影、演员、导演、类型、评分、年份、路径/关联统计相关的问题时，优先调用工具 neo4j_langgraph_query。\n"
+        "- 该工具使用高级 LangGraph 工作流，包含完整的 Cypher 生成、验证、修正和执行流程。\n"
+        "- 在仅需通识解释或闲聊时再直接回答。\n"
+        "- 回答使用简体中文，给出关键实体名与数字；必要时列出前若干条并保持简洁。\n"
+        "- 如果问题与电影无关，工具会自动识别并给出相应提示。\n"
+    )
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("user", "{input}"),
+        MessagesPlaceholder("agent_scratchpad"),
+    ])
+
+    # 使用与 LangGraph 相同的 LLM 配置
+    agent_llm = ChatOpenAI(
+        model=MODEL,
+        temperature=0,
+        api_key=os.getenv("OPENAI_API_KEY"),
+        base_url=os.getenv("OPENAI_BASE_URL"),
+    )
+
+    agent = create_openai_tools_agent(agent_llm, [neo4j_tool], prompt)
+    agent_executor = AgentExecutor(agent=agent, tools=[neo4j_tool], verbose=True)
+
+    print("\n基于 LangGraph 的 Neo4j Agent 已启动，输入 'quit' 退出")
+    
+    while True:
+        user_input = input("\n你: ").strip()
+        if user_input.lower() == "quit":
+            break
+        try:
+            result = await agent_executor.ainvoke({"input": user_input})
+            print(f"\nAI: {result['output']}")
+        except Exception as exc:
+            print(f"\n 出错: {exc}")
+
+    print(" 资源已清理，Bye!")
 
 if __name__ == "__main__":
-    demo()
-
+    import asyncio
+    asyncio.run(run_neo4j_langgraph_agent_chat())

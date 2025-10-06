@@ -1,0 +1,15 @@
+# 前端开发任务
+
+## 1. 需要修改的文件
+{files_to_modify}
+
+## 2. 需求说明
+{requirements}
+
+## 3. 功能参考
+{references}
+
+## 4. 特殊规则
+{special_rules}
+
+请根据以上信息，生成相应的代码实现。

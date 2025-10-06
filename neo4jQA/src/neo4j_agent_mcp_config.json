@@ -2,7 +2,7 @@
   "mcpServers": {
     "neo4j": {
       "command": "python",
-      "args": ["E:\\PythonCode\\prompt agent\\src\\mcp server\\neo4j_server.py"],
+      "args": ["E:\\PythonCode\\neo4jQA\\src\\mcp server\\neo4j_server.py"],
       "transport": "stdio"
     }
   }

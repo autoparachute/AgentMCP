@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "promptServer": {
+      "command": "python",
+      "args": ["E:\\PythonCode\\promptMCP\\prompt_server.py"],
+      "transport": "stdio"
+    }
+  }
+}

@@ -2,27 +2,27 @@
     "mcpServers": {
       "operation": {
         "command": "python",
-        "args": ["E:\\PythonCode\\prompt agent\\src\\mcp server\\operation_server.py"],
+        "args": ["E:\\PythonCode\\neo4jQA\\src\\mcp server\\operation_server.py"],
         "transport": "stdio"
       },
       "hello": {
         "command": "python",
-        "args": ["E:\\PythonCode\\prompt agent\\src\\mcp server\\hello_server.py"],
+        "args": ["E:\\PythonCode\\neo4jQA\\src\\mcp server\\hello_server.py"],
         "transport": "stdio"
       },
       "database": {
         "command": "python",
-        "args": ["E:\\PythonCode\\prompt agent\\src\\mcp server\\database_server.py"],
+        "args": ["E:\\PythonCode\\neo4jQA\\src\\mcp server\\database_server.py"],
         "transport": "stdio"
       },
       "rag": {
         "command": "python",
-        "args": ["E:\\PythonCode\\prompt agent\\src\\mcp server\\rag_server.py"],
+        "args": ["E:\\PythonCode\\neo4jQA\\src\\mcp server\\rag_server.py"],
         "transport": "stdio"
       },
       "neo4j": {
         "command": "python",
-        "args": ["E:\\PythonCode\\prompt agent\\src\\mcp server\\neo4j_server.py"],
+        "args": ["E:\\PythonCode\\neo4jQA\\src\\mcp server\\neo4j_server.py"],
         "transport": "stdio"
       }
     }

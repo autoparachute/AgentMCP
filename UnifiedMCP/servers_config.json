@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "calculateServer": {
-      "command": "python",
-      "args": ["E:\\PythonCode\\promptMCP\\calculate_server.py"],
-      "transport": "stdio"
-    }
-  }
-}
